@@ -1,0 +1,11 @@
+# working notes
+charter.md
+
+# Local experiment scripts and artifacts
+benchmarks/
+*.rds
+*.RData
+
+# Built vignettes are generated at build time.
+vignettes/*.html
+doc/

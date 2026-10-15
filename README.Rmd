@@ -1,0 +1,206 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  out.width = "100%"
+)
+```
+
+# panettone <img src="man/figures/logo.jpg" align="right" height="119" alt="" />
+
+<!-- badges: start -->
+<!-- badges: end -->
+
+zero-shot time-series forecasting with tabular foundation models.
+
+`panettone` turns a time series into supervised tabular regression problems
+(calendar/trend/seasonal features, optional lags), then fits them with a
+swappable tabular in-context learner backend: **TabICL**, **TabPFN**, or
+**Fiorino**. The feature engine never talks to a model directly — each backend
+translates a prepared `(X_train, y_train)` table into its native fit/predict
+interface.
+
+Design mirrors
+[PriorLabs/tabpfn-time-series](https://github.com/PriorLabs/tabpfn-time-series),
+generalized beyond a single engine.
+
+## Installation
+
+```r
+pak::pak("frankiethull/panettone")
+```
+
+Suggested packages (per backend):
+
+- TabICL / TabPFN: `brulee`
+- Fiorino: `fiorino` + `reticulate`
+- Vignette / evaluation helpers: `knitr`, `rmarkdown`, `tictoc`, `testthat`,
+  `hardhat`, `vctrs`
+
+## Quick start
+
+```{r}
+library(panettone)
+
+# 1. Monthly series with trend + annual seasonality
+set.seed(1)
+t <- 1:138
+y <- sin(2 * pi * t / 12) + 0.02 * t + rnorm(length(t), sd = 0.3)
+context <- data.frame(timestamp = t, target = y)
+
+# 2. Pick a backend (TabICL shown; see table below)
+backend <- ts_backend("tabicl", num_estimators = 1L)
+
+# 3. Build a pipeline: backend + shared temporal features
+pipe <- panettone_pipeline(
+  backend = backend,
+  features = default_features(period = 12), # running index + seasonal Fourier
+  max_context_length = 512L,
+  quantiles = c(0.1, 0.5, 0.9)
+)
+
+# 4. Forecast 12 steps ahead
+fc <- predict_df(pipe, context, prediction_length = 12L)
+head(fc)
+```
+
+No model weights handy? Any tabular regressor works via `custom_backend()`:
+
+```{r}
+lm_backend <- custom_backend(
+  fit_fn = function(X, y) stats::lm(.y ~ ., data = cbind(X, .y = y)),
+  predict_fn = function(model, X) as.numeric(stats::predict(model, X))
+)
+pipe <- panettone_pipeline(
+  backend = lm_backend,
+  features = default_features(period = 12),
+  quantiles = NULL # point-only backend
+)
+predict_df(pipe, context, prediction_length = 6L)
+```
+
+## How it works
+
+1. **Normalize** — `as_ts_frame()` canonicalizes input to
+   `(item_id, timestamp, target, covariates)`. Single series get a dummy
+   `item_id`. Works with numeric indices, `Date`, or `POSIXct`.
+2. **Future frame** — `make_future_frame()` extends each series by
+   `prediction_length` using the median sampling step, or bring your own
+   `future_df` with known-future covariates.
+3. **Featurize** — `build_features()` row-binds context + future, applies
+   each generator to the combined frame (so lags can read trailing context),
+   then splits back. Future rows with `NA` features are an error — they would
+   be unknowable at forecast time.
+4. **Fit / predict** — `fit_backend()` + `predict_backend()` translate the
+   feature table into the backend's native interface. `predict_df()` loops
+   per series (sequential in v0.1).
+5. **Evaluate** — `rolling_eval()` does 1-step-ahead rolling-origin scoring;
+   `mae()` / `rmse()` score point forecasts.
+
+Known-future covariates must appear in *both* context and future frames;
+`forecast_horizon()` drops past-only / future-only columns with a warning.
+
+## Backends
+
+| Engine    | Constructor                          | Notes                                                      |
+| --------- | ------------------------------------ | ---------------------------------------------------------- |
+| `tabicl`  | `ts_backend("tabicl", ...)`          | Via `brulee::brulee_tab_icl()`. Native quantiles.          |
+| `tabpfn`  | `ts_backend("tabpfn", ...)`          | Via `brulee::brulee_tab_pfn()`. Native quantiles.          |
+| `fiorino` | `ts_backend("fiorino", ...)`         | Via `fiorino::fiorino_regressor()`. Point-only.            |
+| custom    | `custom_backend(fit_fn, predict_fn)` | Any `function(X, y)` / `function(model, X)` regressor pair. |
+
+```r
+ts_backend("tabpfn", version = "v3.5", num_estimators = 4L)
+ts_backend("fiorino", device = "cpu", seed = 1L)
+
+# point forecasts only
+predict_backend(fit, X_new, quantiles = NULL)
+# with intervals (TabICL/TabPFN/custom-quantile backends only)
+predict_backend(fit, X_new, quantiles = c(0.1, 0.5, 0.9))
+
+supports_quantiles(backend)
+```
+
+### Torch version pin (important)
+
+R-torch backends (`brulee`) and the Python-torch backend (`fiorino` via
+`reticulate`) share one libtorch in the session. R torch bundles libtorch
+2.8.0, so the reticulate environment must match:
+
+```sh
+pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
+```
+
+With mismatched versions the second runtime fails with undefined libtorch
+symbols. See `?fit_backend` / `R/backend.R` and run one engine per process
+when benchmarking.
+
+### Fiorino specifics
+
+Fiorino's bucket head models `log1p(y)`, so the backend shifts train targets
+non-negative (offset fit on train only) and subtracts the offset after
+prediction. It is point-only: requesting quantiles errors. Each fit clones a
+cached prototype estimator so fitted objects stay independent.
+
+## Features
+
+```r
+default_features(period = 12) # feat_running_index() + feat_calendar(period)
+```
+
+- `feat_running_index()` — per-series timestep counter (trend carrier, works
+  even with a plain numeric index). Analog of `RunningIndexFeature`.
+- `feat_calendar(period)` — datetime stamps: sin/cos pairs at natural periods
+  (hour/24, weekday/7, month/12, yearday/365.25); numeric stamps: Fourier
+  pairs at `period` plus a 2nd harmonic. Analog of `CalendarFeature`.
+- `feat_lags(lookback)` — opt-in `lag_1..lag_lookback`. **Direct 1-step-ahead
+  forecasts only**: deeper horizons would need unknowable future targets
+  (recursive multi-step is a planned Phase 2). The reference implementation
+  uses no lags; benchmarks here showed lags help AR-like dynamics but hurt
+  clean seasonality, so strategies stay independently configurable.
+
+## Rolling evaluation
+
+```r
+ev <- rolling_eval(
+  y = y,
+  origins = 130:138, # each origin forecasts y[o] from y[1:(o-1)]
+  pipeline = pipe,
+  timestamp = t
+)
+mae(ev$actual, ev$.pred)
+rmse(ev$actual, ev$.pred)
+```
+
+`rolling_eval()` re-fits the pipeline per origin from history only
+(leakage-free, including Fiorino shifts).
+
+## Vignette
+
+`vignettes/panettone.Rmd` ("Three engines, one adapter") runs all three
+engines on one shared feature table, plots forecasts vs. actuals with 80%
+intervals, and reports MAE + timings.
+
+## Limitations / roadmap
+
+- Univariate numeric targets; direct multi-step forecasting only.
+- No recursive multi-step, exogenous past-only covariates, multi-series
+  joint modeling, or conformal/residual intervals yet (Phase 2).
+- Per-series loop is sequential; series are independent so parallelism is
+  straightforward later.
+
+## Reference
+
+TabPFN-TS feature-pipeline design:
+[PriorLabs/tabpfn-time-series](https://github.com/PriorLabs/tabpfn-time-series).
+
+## License
+
+MIT — see `LICENSE`.

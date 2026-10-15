@@ -1,0 +1,154 @@
+---
+title: "Three engines, one adapter"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Three engines, one adapter}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+# Bind the Python env with fiorino BEFORE either torch runtime loads.
+# R-torch (brulee) bundles libtorch 2.8.0, so the env must carry a matching
+# Python torch: pip install "torch==2.8.0" --index-url \
+# https://download.pytorch.org/whl/cpu
+reticulate::use_virtualenv("r-reticulate", required = FALSE)
+library(panettone)
+tictoc::tic.clearlog()
+```
+
+## The data
+
+A monthly series with trend plus annual seasonality. We train on `t =
+1:138` and hold out `t = 139:150` as the actuals our forecasts compete
+against.
+
+```{r data}
+set.seed(20261014)
+n_train <- 138L
+h <- 12L
+t_all <- seq_len(n_train + h)
+y_all <- sin(2 * pi * t_all / 12) + 0.02 * t_all + rnorm(length(t_all), sd = 0.3)
+
+context <- data.frame(timestamp = seq_len(n_train), target = y_all[seq_len(n_train)])
+actual <- y_all[n_train + seq_len(h)]
+
+plot(context$timestamp, context$target, type = "l", lwd = 2,
+     xlab = "t", ylab = "y", main = "Training data (t = 1:138)")
+```
+
+## Shared features
+
+One feature table for all engines — the whole point of the adapter. A
+running index plus seasonal encodings (reference-style, no lags, so all
+12 horizon rows are knowable at forecast time):
+
+```{r features}
+context <- as_ts_frame(context)
+future <- make_future_frame(context, h)
+feats <- build_features(context, future, default_features(period = 12))
+feature_cols <- setdiff(names(feats$train), c("item_id", "timestamp", "target"))
+X_train <- feats$train[, feature_cols, drop = FALSE]
+y_train <- feats$train$target
+X_test <- feats$test[, feature_cols, drop = FALSE]
+str(X_train)
+```
+
+## TabICL: fit, then predict
+
+```{r tabicl-fit}
+tictoc::tic("tabicl fit")
+fit_icl <- fit_backend(ts_backend("tabicl", num_estimators = 1L), X_train, y_train)
+tictoc::toc(log = TRUE, quiet = TRUE)
+```
+
+```{r tabicl-predict}
+tictoc::tic("tabicl predict")
+pred_icl <- predict_backend(fit_icl, X_test, quantiles = c(0.1, 0.5, 0.9))
+tictoc::toc(log = TRUE, quiet = TRUE)
+pred_icl
+```
+
+## TabPFN: fit, then predict
+
+```{r tabpfn-fit}
+tictoc::tic("tabpfn fit")
+fit_pfn <- fit_backend(ts_backend("tabpfn", version = "v3.5", num_estimators = 4L),
+                       X_train, y_train)
+tictoc::toc(log = TRUE, quiet = TRUE)
+```
+
+```{r tabpfn-predict}
+tictoc::tic("tabpfn predict")
+pred_pfn <- predict_backend(fit_pfn, X_test, quantiles = c(0.1, 0.5, 0.9))
+tictoc::toc(log = TRUE, quiet = TRUE)
+pred_pfn
+```
+
+## Fiorino: fit, then predict
+
+Fiorino's bucket head models `log1p(y)`, so the backend shifts targets
+non-negative on train statistics and inverts after prediction (see
+`?fit_backend`). It is point-only — no native quantiles:
+
+```{r fiorino-fit}
+tictoc::tic("fiorino fit")
+fit_fio <- fit_backend(ts_backend("fiorino", device = "cpu"), X_train, y_train)
+tictoc::toc(log = TRUE, quiet = TRUE)
+```
+
+```{r fiorino-predict}
+tictoc::tic("fiorino predict")
+pred_fio <- predict_backend(fit_fio, X_test, quantiles = NULL)
+tictoc::toc(log = TRUE, quiet = TRUE)
+pred_fio
+```
+
+## Forecasts vs actuals
+
+```{r plot-compare, fig.width = 7, fig.height = 4.5}
+ts <- n_train + seq_len(h)
+ylim <- range(actual, pred_icl$.pred, pred_pfn$.pred, pred_fio$.pred)
+plot(ts, actual, type = "b", pch = 16, lwd = 2,
+     ylim = ylim, xlab = "t", ylab = "y",
+     main = "12-step forecasts vs actuals")
+lines(ts, pred_icl$.pred, col = "steelblue", lwd = 2, lty = 2)
+lines(ts, pred_pfn$.pred, col = "darkgreen", lwd = 2, lty = 2)
+lines(ts, pred_fio$.pred, col = "tomato", lwd = 2, lty = 2)
+legend("topleft", c("actual", "tabicl", "tabpfn", "fiorino"),
+       col = c("black", "steelblue", "darkgreen", "tomato"),
+       lty = c(1, 2, 2, 2), lwd = 2, pch = c(16, NA, NA, NA), bty = "n")
+```
+
+## Prediction intervals
+
+Native 80% intervals for the two quantile backends (Fiorino stays
+point-only until a residual/conformal layer lands):
+
+```{r plot-intervals, fig.width = 7, fig.height = 5}
+par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+iv <- list(tabicl = pred_icl, tabpfn = pred_pfn)
+for (eng in names(iv)) {
+  p <- iv[[eng]]
+  plot(ts, actual, type = "b", pch = 16,
+       ylim = range(actual, p$q0.1, p$q0.9),
+       xlab = "t", ylab = "y", main = eng)
+  polygon(c(ts, rev(ts)), c(p$q0.1, rev(p$q0.9)),
+          col = grDevices::adjustcolor("steelblue", 0.25), border = NA)
+  lines(ts, p$.pred, col = "steelblue", lwd = 2)
+}
+```
+
+## Speed and accuracy
+
+```{r score}
+scores <- data.frame(
+  engine = c("tabicl", "tabpfn", "fiorino"),
+  MAE = round(c(mae(actual, pred_icl$.pred),
+                mae(actual, pred_pfn$.pred),
+                mae(actual, pred_fio$.pred)), 3)
+)
+scores
+tictoc::tic.log(format = TRUE)
+```

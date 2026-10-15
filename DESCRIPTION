@@ -1,0 +1,30 @@
+Package: panettone
+Title: zero-shot time-series forecasting with tabular foundation models
+Version: 0.0.0.9000
+Authors@R: person("frank", "hull", email = "frankiethull@gmail.com",
+                  role = c("aut", "cre"))
+Description: Adapts tabular in-context learners (TabICL, TabPFN, Fiorino)
+    into time-series forecasters. A shared temporal feature engine turns
+    each series into supervised tabular regression problems
+    (calendar/trend/seasonal features, optional lags); swappable backend
+    adapters translate the feature table into each engine's native
+    fit/predict interface. Mirrors the 'PriorLabs/tabpfn-time-series'
+    pipeline design, generalized beyond a single engine.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Imports:
+    stats
+Suggests:
+    brulee,
+    fiorino,
+    hardhat,
+    knitr,
+    reticulate,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    tictoc,
+    vctrs
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.0
